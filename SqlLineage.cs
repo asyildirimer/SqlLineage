@@ -3758,9 +3758,13 @@ sealed class LineageRun
     void PrePassCallerArgs(List<(ServerCatalog srv, DbCatalog db, ObjInfo mod)> modules)
     {
         var sw = Stopwatch.StartNew();
-        int found = 0, created = 0;
-        Parallel.ForEach(modules.Where(m => m.mod.Definition != null && m.mod.TypeCode is "P" or "TR" or "JOB" or "FILE"), new ParallelOptions { MaxDegreeOfParallelism = cfg.Parallelism }, m =>
+        int found = 0, created = 0, scanned = 0;
+        var preList = modules.Where(m => m.mod.Definition != null && m.mod.TypeCode is "P" or "TR" or "JOB" or "FILE").ToList();
+        Log.Info($"Ön geçiş başlıyor: {preList.Count} prosedür/trigger/job (çağıran literal argümanları + kod yaratan tablolar)");
+        Parallel.ForEach(preList, new ParallelOptions { MaxDegreeOfParallelism = cfg.Parallelism }, m =>
         {
+            int n = Interlocked.Increment(ref scanned);
+            if (n % 10000 == 0) Log.Info($"  ön geçiş {n}/{preList.Count}");
             try
             {
                 var pr = ParserLadder.Parse(m.mod.Definition!, m.mod.QuotedIdentifier, m.srv.Major, m.db.Compat);
