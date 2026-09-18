@@ -1,0 +1,7 @@
+out/
+bin/
+bin-win/
+obj/
+*.xlsx
+lineage.json
+.DS_Store
