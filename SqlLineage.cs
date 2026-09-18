@@ -42,7 +42,7 @@ return await App.RunAsync(args);
 
 static class App
 {
-    public const string EngineVersion = "1.3.0";
+    public const string EngineVersion = "1.3.1";
     public static async Task<int> RunAsync(string[] args)
     {
         if (args.Length > 0 && args[0].Equals("infa", StringComparison.OrdinalIgnoreCase)) return await InfaLineage.App.RunAsync(args[1..]);
@@ -3569,8 +3569,10 @@ sealed partial class ModuleAnalyzer
         string status = "Unresolved"; var errors = new List<string>();
         var alts = dyn.ExpandValues(templates);
         int alternativesRun = 0;
+        int baseStmtNo = stmtNo;   // her alternatif aynı ifade numarasından başlar: aynı kenar tekrar üretilmez (colKeys/objKeys)
         foreach (var alt in alts.Take(cfg.MaxDynamicAlternatives))
         {
+            stmtNo = baseStmtNo;
             var (text, partial) = dyn.Materialize(alt);
             if (string.IsNullOrWhiteSpace(text)) continue;
             alternativesRun++;
