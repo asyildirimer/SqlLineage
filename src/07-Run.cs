@@ -221,7 +221,7 @@ sealed class DbTaskRunner
     void RunWorkers(List<ObjInfo> modules, Action<ObjInfo> work, bool stream, string label)
     {
         int par = Math.Max(1, cfg.Parallelism);
-        var queue = new BlockingCollection<ObjInfo>(boundedCapacity: par * 4);
+        var queue = new BlockingCollection<ObjInfo>(boundedCapacity: Math.Max(128, par * 16));
         int done = 0, total = modules.Count;
         var progress = Stopwatch.StartNew();
         var workers = new List<Thread>();
@@ -441,7 +441,7 @@ sealed class DbTaskRunner
         row.BindRate = row.ObjectRefs == 0 ? 1 : Math.Round(row.ObjectRefsResolved / (double)row.ObjectRefs, 4);
         row.DynamicResolutionRate = row.DynamicSites == 0 ? 1 : Math.Round(row.DynamicResolved / (double)row.DynamicSites, 4);
         int errors = statuses.Count(x => x is "Error" or "Timeout");
-        Log.Info($"[{srv.ConfigName}.{db.Name}] analiz: modül {row.Modules}, parse {row.ParseRate:P1}, bind {row.BindRate:P1}, dinamik {row.DynamicSites} site / {row.DynamicResolutionRate:P0}, kolon {row.ColumnLineageRows:N0}, nesne {row.ObjectLineageRows:N0}, katalog kaçağı {missed}{(errors > 0 ? $", HATA {errors} modül (Modules.csv Errors)" : "")}{(row.ReusedModules > 0 ? $", {row.ReusedModules} önceki koşudan" : "")}, {sw.Elapsed.TotalSeconds:F0} s");
+        Log.Info($"[{srv.ConfigName}.{db.Name}] analiz: modül {row.Modules}, parse {row.ParseRate:P1}, bind {row.BindRate:P1}, dinamik {row.DynamicSites} site / {row.DynamicResolutionRate:P0}, kolon {row.ColumnLineageRows:N0}, nesne {row.ObjectLineageRows:N0}, katalog kaçağı {missed}{(errors > 0 ? $", HATA {errors} modül (Modules.csv Errors)" : "")}{(row.ReusedModules > 0 ? $", {row.ReusedModules} önceki koşudan" : "")}, {sw.Elapsed.TotalSeconds:F0} s (tanım çekme {db.FetchMs / 1000.0:F0} s / {db.FetchBatches} parti{(db.FetchRetries > 0 ? $", {db.FetchRetries} yeniden deneme" : "")}{(db.SingleFetches > 0 ? $", {db.SingleFetches} tekil çekim" : "")})");
         return row;
     }
 }

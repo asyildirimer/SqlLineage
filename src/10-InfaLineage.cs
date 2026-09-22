@@ -801,31 +801,68 @@ sealed class InfaRun
         return (tgtCols, tgtWith);
     }
 
+    /// <summary>Hedef porttan kaynağa geriye yürür. Düğüm başına sonuç kümesi bir kez hesaplanıp önbelleklenir (memo): elmas biçimli
+    /// mapping'lerde yol sayısı üstel büyür, önbellek olmadan saatler sürer. Hops = en kısa, Path = ilk bulunan yol.</summary>
     void Walk(MappingGraph g, string inst, string port, int hops, string path, FlowKind kind, HashSet<string> visited, string expr, Action<string, string, int, string, FlowKind, string> emit)
     {
+        foreach (var r in Sources(g, inst, port, new HashSet<string>(StringComparer.OrdinalIgnoreCase)))
+        {
+            if (r.hops == 0) continue;   // hedef portun kendisi (girişi yok) kaynak değildir
+            var k = (kind == FlowKind.Indirect || r.kind == FlowKind.Indirect) ? FlowKind.Indirect : Stronger(kind, r.kind);
+            emit(r.inst, r.port, hops + r.hops, r.path + " → " + path, k, r.expr != "" ? r.expr : expr);
+        }
+    }
+
+    sealed record SrcResult(string inst, string port, int hops, string path, FlowKind kind, string expr);
+    readonly Dictionary<MappingGraph, Dictionary<string, List<SrcResult>>> _memo = new();
+    const int MaxResultsPerNode = 5000;
+
+    /// <summary>(inst, port) düğümünü besleyen uç kaynaklar; path = "src.port → … → inst.port" (bu düğüm dahil).</summary>
+    List<SrcResult> Sources(MappingGraph g, string inst, string port, HashSet<string> onStack)
+    {
         string key = MappingGraph.Key(inst, port);
-        if (hops > cfg.MaxCollapseDepth || !visited.Add(key)) return;
+        if (!_memo.TryGetValue(g, out var memo)) _memo[g] = memo = new(StringComparer.OrdinalIgnoreCase);
+        if (memo.TryGetValue(key, out var cached)) return cached;
+        var result = new List<SrcResult>();
+        if (!onStack.Add(key)) return result;   // döngü: bu kenar üzerinden yol yok
         var edges = g.Incoming.GetValueOrDefault(key) ?? g.Incoming.GetValueOrDefault(MappingGraph.Key(inst, "*"));
+        bool complete = true;
         if (edges == null || edges.Count == 0)
+            result.Add(new SrcResult(inst, port, 0, inst + "." + port, FlowKind.Direct, ""));   // girişi olmayan port: sabit/bağlantısız kaynak
+        else
         {
-            if (hops > 0) emit(inst, port, hops, path, kind, expr);
-            visited.Remove(key); return;
-        }
-        foreach (var e in edges)
-        {
-            var k2 = (kind == FlowKind.Indirect || e.Kind == FlowKind.Indirect) ? FlowKind.Indirect : Stronger(kind, e.Kind);
-            string p2 = e.FromInst + "." + e.FromPort + " → " + path;
-            string ex2 = e.Expr != "" ? e.Expr : expr;
-            var si = g.Instances.GetValueOrDefault(e.FromInst);
-            bool endpoint = (si != null && si.Type is "SOURCE" or "LOOKUPTABLE" or "SQLTABLE" or "PROCEDURE") || e.FromInst.StartsWith("SQL:") || e.FromInst.StartsWith("LKP:") || e.FromInst.StartsWith("SP:");
-            if (endpoint)
+            var best = new Dictionary<string, SrcResult>(StringComparer.OrdinalIgnoreCase);
+            foreach (var e in edges)
             {
-                string k = MappingGraph.Key(e.FromInst, e.FromPort);
-                if (visited.Add(k)) { emit(e.FromInst, e.FromPort, hops + 1, p2, k2, ex2); visited.Remove(k); }
+                var si = g.Instances.GetValueOrDefault(e.FromInst);
+                bool endpoint = (si != null && si.Type is "SOURCE" or "LOOKUPTABLE" or "SQLTABLE" or "PROCEDURE") || e.FromInst.StartsWith("SQL:") || e.FromInst.StartsWith("LKP:") || e.FromInst.StartsWith("SP:");
+                string here = inst + "." + port;
+                if (endpoint)
+                {
+                    Add(best, new SrcResult(e.FromInst, e.FromPort, 1, e.FromInst + "." + e.FromPort + " → " + here, e.Kind, e.Expr));
+                    continue;
+                }
+                string fk = MappingGraph.Key(e.FromInst, e.FromPort);
+                if (onStack.Contains(fk)) { complete = false; continue; }
+                foreach (var r in Sources(g, e.FromInst, e.FromPort, onStack))
+                {
+                    var k = (r.kind == FlowKind.Indirect || e.Kind == FlowKind.Indirect) ? FlowKind.Indirect : Stronger(r.kind, e.Kind);
+                    Add(best, new SrcResult(r.inst, r.port, r.hops + 1, r.path + " → " + here, k, r.expr != "" ? r.expr : e.Expr));
+                    if (best.Count >= MaxResultsPerNode) break;
+                }
+                if (best.Count >= MaxResultsPerNode) break;
             }
-            else Walk(g, e.FromInst, e.FromPort, hops + 1, p2, k2, visited, ex2, emit);
+            result.AddRange(best.Values);
         }
-        visited.Remove(key);
+        onStack.Remove(key);
+        if (complete) memo[key] = result;   // döngü nedeniyle eksik kalan sonuç önbelleğe alınmaz
+        return result;
+
+        static void Add(Dictionary<string, SrcResult> best, SrcResult r)
+        {
+            string k = r.inst + "|" + r.port + "|" + r.kind;
+            if (!best.TryGetValue(k, out var cur) || r.hops < cur.hops) best[k] = r;
+        }
     }
     static FlowKind Stronger(FlowKind a, FlowKind b)
     {

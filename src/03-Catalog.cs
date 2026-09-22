@@ -89,6 +89,8 @@ sealed class DbCatalog
     public Func<ObjInfo, string?>? DefinitionFetcher;
     /// <summary>Modül tanımlarını akış halinde verir (sys.sql_modules tek sorgu). Dosya modunda modülleri olduğu gibi döner.</summary>
     public Func<IEnumerable<ObjInfo>, IEnumerable<ObjInfo>>? DefinitionStreamer;
+    /// <summary>Tanım çekme istatistikleri (görev özeti için).</summary>
+    public long FetchMs, FetchBatches, FetchRetries, SingleFetches;
 
     public ObjInfo? Find(string schema, string name)
     {
@@ -514,6 +516,7 @@ static class CatalogLoader
     /// <summary>Tek nesnenin tanımı (tembel; view/TVF kolon türetimi gibi seyrek ihtiyaçlar için).</summary>
     static string? FetchDefinition(string cs, string dbName, ObjInfo o)
     {
+        if (o.Db != null) Interlocked.Increment(ref o.Db.SingleFetches);
         try
         {
             using var cn = new SqlConnection(cs); cn.Open();
@@ -529,42 +532,52 @@ static class CatalogLoader
         catch (Exception ex) { Log.Debug($"tanım çekilemedi {o.Ref}: {ex.Message}"); return null; }
     }
 
-    /// <summary>Modül tanımlarını kısa partiler halinde çeker (parti başına ayrı kısa sorgu, yeniden denemeli): bağlantı dakikalarca açık kalmaz,
-    /// bellekte yalnız o an işlenen tanımlar durur. Parti kesin başarısız olursa yalnız o modüller LoadError ile işaretlenir.</summary>
+    /// <summary>Modül tanımlarını kısa partiler halinde çeker: tek bağlantı sürekli kullanılır (boşta kalıp kesilmez), kopunca yeniden açılır;
+    /// ilk yeniden deneme beklemesiz (havuzdaki ölü bağlantı), sonrakiler artan bekleme. Parti kesin başarısız olursa yalnız o modüller LoadError olur.</summary>
     static IEnumerable<ObjInfo> StreamDefinitions(string cs, string dbName, DbCatalog db, IEnumerable<ObjInfo> modules)
     {
         var wanted = modules.ToList();
         var pending = wanted.Where(m => m.HasModuleRow && !m.DefinitionMissing && !m.DefinitionLoaded && m.Db == db).ToList();
         var pendingSet = new HashSet<ObjInfo>(pending);
-        // tanımı zaten bellekte olanlar / tanımsızlar (CLR, şifreli, job, dosya) hemen
         foreach (var m in wanted) if (!pendingSet.Contains(m)) yield return m;
-        const int batch = 32;
-        for (int i = 0; i < pending.Count; i += batch)
+        const int batch = 64;
+        SqlConnection? cn = null;
+        try
         {
-            var slice = pending.Skip(i).Take(batch).ToList();
-            Exception? last = null;
-            for (int attempt = 0; attempt < 5; attempt++)
+            for (int i = 0; i < pending.Count; i += batch)
             {
-                try { FetchBatch(cs, dbName, slice); last = null; break; }
-                catch (Exception ex) when (ex is SqlException or IOException or InvalidOperationException)
+                var slice = pending.Skip(i).Take(batch).ToList();
+                Exception? last = null;
+                var sw = Stopwatch.StartNew();
+                for (int attempt = 0; attempt < 6; attempt++)
                 {
-                    last = ex;
-                    Log.Debug($"tanım partisi {dbName} #{i / batch} deneme {attempt + 1}: {ex.Message}");
-                    Thread.Sleep(2000 * (attempt + 1));
+                    try
+                    {
+                        if (cn == null || cn.State != ConnectionState.Open) { cn?.Dispose(); cn = new SqlConnection(cs); cn.Open(); }
+                        FetchBatch(cn, dbName, slice); last = null; break;
+                    }
+                    catch (Exception ex) when (ex is SqlException or IOException or InvalidOperationException)
+                    {
+                        last = ex; Interlocked.Increment(ref db.FetchRetries);
+                        Log.Debug($"tanım partisi {dbName} #{i / batch} deneme {attempt + 1}: {ex.Message}");
+                        try { cn?.Dispose(); } catch { } cn = null;
+                        if (attempt > 0) Thread.Sleep(1000 * attempt);
+                    }
                 }
+                Interlocked.Add(ref db.FetchMs, sw.ElapsedMilliseconds); Interlocked.Increment(ref db.FetchBatches);
+                if (last != null)
+                {
+                    Log.Warn($"[{dbName}] {slice.Count} modülün tanımı 6 denemede çekilemedi: {last.Message}");
+                    foreach (var m in slice) { m.LoadError = "tanım çekilemedi: " + last.Message; m.SetStreamedDefinition(null); }
+                }
+                foreach (var m in slice) yield return m;
             }
-            if (last != null)
-            {
-                Log.Warn($"[{dbName}] {slice.Count} modülün tanımı 5 denemede çekilemedi: {last.Message}");
-                foreach (var m in slice) { m.LoadError = "tanım çekilemedi: " + last.Message; m.SetStreamedDefinition(null); }
-            }
-            foreach (var m in slice) yield return m;
         }
+        finally { cn?.Dispose(); }
     }
 
-    static void FetchBatch(string cs, string dbName, List<ObjInfo> slice)
+    static void FetchBatch(SqlConnection cn, string dbName, List<ObjInfo> slice)
     {
-        using var cn = new SqlConnection(cs); cn.Open();
         var normal = slice.Where(m => m.ProcedureNumber == null).ToList();
         if (normal.Count > 0)
         {
@@ -580,7 +593,6 @@ static class CatalogLoader
             cmd.Parameters.AddWithValue("@id", m.NumberedParentId); cmd.Parameters.AddWithValue("@n", m.ProcedureNumber!.Value);
             m.SetStreamedDefinition(cmd.ExecuteScalar() as string);
         }
-        // sorguda görünmeyenler (tarama ile yükleme arasında silinmiş vb.)
         foreach (var m in slice) if (!m.DefinitionLoaded) { m.SetStreamedDefinition(null); m.DefinitionMissing = true; }
     }
 }
