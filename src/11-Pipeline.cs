@@ -60,9 +60,20 @@ static class PlanStore
     public static void Save(PlanFile plan, string workDir)
     {
         Directory.CreateDirectory(workDir);
-        var tmp = PlanPath(workDir) + "." + Guid.NewGuid().ToString("N")[..8] + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(plan, Cli.JsonOpts), new UTF8Encoding(false));
-        File.Move(tmp, PlanPath(workDir), overwrite: true);
+        var path = PlanPath(workDir);
+        var json = JsonSerializer.Serialize(plan, Cli.JsonOpts);
+        var tmp = path + "." + Guid.NewGuid().ToString("N")[..8] + ".tmp";
+        File.WriteAllText(tmp, json, new UTF8Encoding(false));
+        // Windows: hedef dosya o an başka bir işlemce (Defender, indeksleyici, okuyan düğüm) açıksa taşıma
+        // "Access denied" / paylaşım ihlali verir; geçicidir → yeniden dene, en sonda doğrudan yaz.
+        Exception? last = null;
+        for (int i = 0; i < 30; i++)
+        {
+            try { File.Move(tmp, path, overwrite: true); return; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { last = ex; Thread.Sleep(100 + i * 50); }
+        }
+        try { File.WriteAllText(path, json, new UTF8Encoding(false)); try { File.Delete(tmp); } catch { } Log.Warn("plan.json taşınamadı, doğrudan yazıldı: " + last?.Message); }
+        catch (Exception ex) { throw new IOException($"plan.json yazılamadı ({path}): {ex.Message}; geçici kopya: {tmp}", ex); }
     }
     /// <summary>Kilit altında oku-değiştir-yaz. Kilit 60 s içinde alınamazsa (eski kilit) kırılır.</summary>
     public static T Update<T>(string workDir, Func<PlanFile, T> change)
@@ -84,8 +95,9 @@ static class PlanStore
                 }
                 finally { fs.Dispose(); try { File.Delete(lockPath); } catch { } }
             }
-            catch (IOException) when (File.Exists(lockPath))
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
+                if (!File.Exists(lockPath) && sw.Elapsed.TotalSeconds > 30) throw;
                 if (sw.Elapsed.TotalSeconds > 60 && (DateTime.UtcNow - File.GetCreationTimeUtc(lockPath)).TotalSeconds > 60) { Log.Warn("plan.lock eski; kırılıyor"); try { File.Delete(lockPath); } catch { } }
                 Thread.Sleep(Random.Shared.Next(50, 250));
             }
@@ -246,12 +258,19 @@ public static class LineagePipeline
             Log.Error($"Görev {task.Id} başarısız: {ex}");
         }
         task.FinishedAt = DateTime.Now; task.ElapsedMs = sw.ElapsedMilliseconds; task.Node = node;
-        if (updatePlan) PlanStore.Update(workDir, p =>
+        if (updatePlan)
         {
-            var t = p.Tasks.First(x => x.Id == task.Id);
-            t.Status = task.Status; t.Error = task.Error; t.FinishedAt = task.FinishedAt; t.ElapsedMs = task.ElapsedMs; t.Part = task.Part; t.Node = node;
-            return 0;
-        });
+            try
+            {
+                PlanStore.Update(workDir, p =>
+                {
+                    var t = p.Tasks.First(x => x.Id == task.Id);
+                    t.Status = task.Status; t.Error = task.Error; t.FinishedAt = task.FinishedAt; t.ElapsedMs = task.ElapsedMs; t.Part = task.Part; t.Node = node;
+                    return 0;
+                });
+            }
+            catch (Exception ex) { Log.Error($"plan.json güncellenemedi (görev {task.Id} {task.Status}; parça diskte): {ex.Message}"); }
+        }
         Log.Info($"Görev {task.Id}: {task.Status}, {sw.Elapsed.TotalSeconds:F0} s");
         // katalog/önbellekler bir sonraki görev için serbest
         ModuleAnalyzer.ResetCaches();
