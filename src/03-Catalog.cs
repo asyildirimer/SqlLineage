@@ -35,6 +35,7 @@ sealed class ObjInfo
     public int NumberedParentId;           // numaralı prosedür: ana prosedürün object_id'si
     public bool IsMsShipped;
     public DbCatalog? Db;                  // sahibi (tembel tanım çekimi için)
+    public string? LoadError;              // tanım sunucudan çekilemedi (görev sürer, modül Error olur)
 
     string? _definition; bool _defFetched;
     /// <summary>Modül metni. Sunucu kataloğunda tembeldir: ilk okumada tek nesne için çekilir; analiz sonrası <see cref="ReleaseDefinition"/> ile bırakılır.</summary>
@@ -309,7 +310,7 @@ static class CatalogLoader
                 s.Name = r.GetString(0); s.Version = r.GetString(1); s.MachineName = r.IsDBNull(2) ? "" : r.GetString(2);
                 s.Major = int.TryParse(s.Version.Split('.')[0], out var mj) ? mj : 15;
             }
-            Log.Info($"[{cc.Name}] bağlandı: {s.Name} (v{s.Version})");
+            Log.Debug($"[{cc.Name}] bağlandı: {s.Name} (v{s.Version})");
             ConfigTableReader.Connections[s.Name] = cc.ConnectionString;
 
             // linked servers
@@ -331,7 +332,7 @@ static class CatalogLoader
                     using var r = await cmd.ExecuteReaderAsync();
                     while (await r.ReadAsync())
                         s.JobSteps.Add(new JobStepInfo { JobName = r.GetString(0), StepId = r.GetInt32(1), StepName = r.GetString(2), Subsystem = r.GetString(3), Command = r.GetString(4), DatabaseName = r.GetString(5), Enabled = r.GetByte(6) == 1 });
-                    Log.Info($"[{cc.Name}] {s.JobSteps.Count} job adımı");
+                    Log.Debug($"[{cc.Name}] {s.JobSteps.Count} job adımı");
                 }
                 catch (Exception ex) { Log.Warn($"[{cc.Name}] msdb job adımları okunamadı: {ex.Message}"); }
             }
@@ -344,11 +345,11 @@ static class CatalogLoader
                     var name = r.GetString(0); int id = r.GetInt32(3);
                     var dbList = cc.Databases.Count > 0 ? cc.Databases : cfg.Databases;
                     bool wanted = dbList.Contains("*") ? id > 4 && !NameComparer.Eq(name, "distribution") : dbList.Any(d => NameComparer.Eq(d, name));
-                    if (wanted && (cc.ExcludeDatabases.Any(x => NameComparer.Eq(x, name)) || cfg.ExcludeDatabases.Any(x => NameComparer.Eq(x, name)))) { Log.Info($"[{cc.Name}] {name} hariç tutuldu (excludeDatabases)"); wanted = false; }
-                    if (wanted && cfg.SkipArchiveDatabases && cat.IsArchive(name)) { Log.Info($"[{cc.Name}] {name} arşiv DB (→ {cat.Canonical(name)}), taranmıyor"); wanted = false; }
+                    if (wanted && (cc.ExcludeDatabases.Any(x => NameComparer.Eq(x, name)) || cfg.ExcludeDatabases.Any(x => NameComparer.Eq(x, name)))) { Log.Debug($"[{cc.Name}] {name} hariç tutuldu (excludeDatabases)"); wanted = false; }
+                    if (wanted && cfg.SkipArchiveDatabases && cat.IsArchive(name)) { Log.Debug($"[{cc.Name}] {name} arşiv DB (→ {cat.Canonical(name)}), taranmıyor"); wanted = false; }
                     if (wanted) s.KnownDbs[name] = new KnownDb { Name = name, Compat = Convert.ToInt32(r.GetValue(1)), Collation = r.GetString(2), DatabaseId = id };
                 }
-            Log.Info($"[{cc.Name}] {s.KnownDbs.Count} DB listelendi ({sw.ElapsedMilliseconds} ms); içerik ilk erişimde yüklenir");
+            Log.Debug($"[{cc.Name}] {s.KnownDbs.Count} DB listelendi ({sw.ElapsedMilliseconds} ms); içerik ilk erişimde yüklenir");
             return s;
         }
         catch (Exception ex)
@@ -490,7 +491,7 @@ static class CatalogLoader
         db.DefinitionFetcher = o => FetchDefinition(cs, dbName, o);
         db.DefinitionStreamer = mods => StreamDefinitions(cs, dbName, db, mods);
         if (withDeps) LoadDeps(s, db, cn);
-        Log.Info($"  {s.Name}.{dbName}: {db.Objects.Count} nesne, {db.Modules.Count} modül, compat {k.Compat}{(withDeps ? ", bağımlılıklar" : "")} ({sw.ElapsedMilliseconds} ms)");
+        Log.Debug($"  {s.Name}.{dbName}: {db.Objects.Count} nesne, {db.Modules.Count} modül, compat {k.Compat}{(withDeps ? ", bağımlılıklar" : "")} ({sw.ElapsedMilliseconds} ms)");
         return db;
     }
 
@@ -528,43 +529,59 @@ static class CatalogLoader
         catch (Exception ex) { Log.Debug($"tanım çekilemedi {o.Ref}: {ex.Message}"); return null; }
     }
 
-    /// <summary>Modül tanımlarını tek sorguyla akış halinde verir: bellekte yalnız o an işlenen tanımlar durur.</summary>
+    /// <summary>Modül tanımlarını kısa partiler halinde çeker (parti başına ayrı kısa sorgu, yeniden denemeli): bağlantı dakikalarca açık kalmaz,
+    /// bellekte yalnız o an işlenen tanımlar durur. Parti kesin başarısız olursa yalnız o modüller LoadError ile işaretlenir.</summary>
     static IEnumerable<ObjInfo> StreamDefinitions(string cs, string dbName, DbCatalog db, IEnumerable<ObjInfo> modules)
     {
-        var wanted = new HashSet<ObjInfo>(modules);
-        var pending = new HashSet<ObjInfo>(wanted.Where(m => m.HasModuleRow && !m.DefinitionMissing && !m.DefinitionLoaded && m.Db == db));
+        var wanted = modules.ToList();
+        var pending = wanted.Where(m => m.HasModuleRow && !m.DefinitionMissing && !m.DefinitionLoaded && m.Db == db).ToList();
+        var pendingSet = new HashSet<ObjInfo>(pending);
         // tanımı zaten bellekte olanlar / tanımsızlar (CLR, şifreli, job, dosya) hemen
-        foreach (var m in wanted) if (!pending.Contains(m)) yield return m;
-        if (pending.Count == 0) yield break;
-        using var cn = new SqlConnection(cs); cn.Open();
-        using (var cmd = new SqlCommand($"SELECT m.object_id, m.definition FROM {Q(dbName)}.sys.sql_modules m", cn) { CommandTimeout = 0 })
-        using (var r = cmd.ExecuteReader(CommandBehavior.SequentialAccess))
-            while (r.Read())
-            {
-                int id = r.GetInt32(0);
-                if (!db.ById.TryGetValue(id, out var o) || !pending.Remove(o)) continue;
-                o.SetStreamedDefinition(r.IsDBNull(1) ? null : r.GetString(1));
-                yield return o;
-            }
-        if (pending.Count > 0)
+        foreach (var m in wanted) if (!pendingSet.Contains(m)) yield return m;
+        const int batch = 32;
+        for (int i = 0; i < pending.Count; i += batch)
         {
-            var numbered = pending.Where(p => p.ProcedureNumber != null).ToList();
-            if (numbered.Count > 0)
+            var slice = pending.Skip(i).Take(batch).ToList();
+            Exception? last = null;
+            for (int attempt = 0; attempt < 5; attempt++)
             {
-                using var cmd = new SqlCommand($"SELECT object_id, procedure_number, definition FROM {Q(dbName)}.sys.numbered_procedures", cn) { CommandTimeout = 0 };
-                using var r = cmd.ExecuteReader(CommandBehavior.SequentialAccess);
-                while (r.Read())
+                try { FetchBatch(cs, dbName, slice); last = null; break; }
+                catch (Exception ex) when (ex is SqlException or IOException or InvalidOperationException)
                 {
-                    int id = r.GetInt32(0); int num = Convert.ToInt32(r.GetValue(1));
-                    var o = numbered.FirstOrDefault(p => p.NumberedParentId == id && p.ProcedureNumber == num);
-                    if (o == null || !pending.Remove(o)) continue;
-                    o.SetStreamedDefinition(r.IsDBNull(2) ? null : r.GetString(2));
-                    yield return o;
+                    last = ex;
+                    Log.Debug($"tanım partisi {dbName} #{i / batch} deneme {attempt + 1}: {ex.Message}");
+                    Thread.Sleep(2000 * (attempt + 1));
                 }
             }
+            if (last != null)
+            {
+                Log.Warn($"[{dbName}] {slice.Count} modülün tanımı 5 denemede çekilemedi: {last.Message}");
+                foreach (var m in slice) { m.LoadError = "tanım çekilemedi: " + last.Message; m.SetStreamedDefinition(null); }
+            }
+            foreach (var m in slice) yield return m;
         }
-        // sorguda görünmeyenler (tarama ile yükleme arasında silinmiş vb.): tanımsız olarak ver
-        foreach (var m in pending) { m.SetStreamedDefinition(null); m.DefinitionMissing = true; yield return m; }
+    }
+
+    static void FetchBatch(string cs, string dbName, List<ObjInfo> slice)
+    {
+        using var cn = new SqlConnection(cs); cn.Open();
+        var normal = slice.Where(m => m.ProcedureNumber == null).ToList();
+        if (normal.Count > 0)
+        {
+            var byId = normal.ToDictionary(m => m.ObjectId);
+            using var cmd = new SqlCommand($"SELECT object_id, definition FROM {Q(dbName)}.sys.sql_modules WHERE object_id IN ({string.Join(",", byId.Keys)})", cn) { CommandTimeout = 300 };
+            using var r = cmd.ExecuteReader(CommandBehavior.SequentialAccess);
+            while (r.Read())
+                if (byId.TryGetValue(r.GetInt32(0), out var o)) o.SetStreamedDefinition(r.IsDBNull(1) ? null : r.GetString(1));
+        }
+        foreach (var m in slice.Where(m => m.ProcedureNumber != null))
+        {
+            using var cmd = new SqlCommand($"SELECT definition FROM {Q(dbName)}.sys.numbered_procedures WHERE object_id = @id AND procedure_number = @n", cn) { CommandTimeout = 120 };
+            cmd.Parameters.AddWithValue("@id", m.NumberedParentId); cmd.Parameters.AddWithValue("@n", m.ProcedureNumber!.Value);
+            m.SetStreamedDefinition(cmd.ExecuteScalar() as string);
+        }
+        // sorguda görünmeyenler (tarama ile yükleme arasında silinmiş vb.)
+        foreach (var m in slice) if (!m.DefinitionLoaded) { m.SetStreamedDefinition(null); m.DefinitionMissing = true; }
     }
 }
 
@@ -663,7 +680,7 @@ static class FileCatalog
             }
         }
         db.Modules = db.Objects.Values.Where(o => o.IsModule).ToList();
-        Log.Info($"[FILES] {files.Count} dosya, {db.Modules.Count} modül, {synthetic} sentetik tablo");
+        Log.Debug($"[FILES] {files.Count} dosya, {db.Modules.Count} modül, {synthetic} sentetik tablo");
         return s;
     }
 

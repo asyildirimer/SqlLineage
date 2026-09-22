@@ -194,7 +194,7 @@ public static class LineagePipeline
     {
         var sw = Stopwatch.StartNew();
         string runId = plan.RunId;
-        Log.Info($"Görev {task.Id} (RunId {runId}, düğüm {node})");
+        Log.Info($"Görev {task.Id} başladı (düğüm {node})");
         try
         {
             ModuleAnalyzer.ResetCaches();
@@ -255,7 +255,8 @@ public static class LineagePipeline
         catch (Exception ex)
         {
             task.Status = "failed"; task.Error = ex.GetType().Name + ": " + ex.Message;
-            Log.Error($"Görev {task.Id} başarısız: {ex}");
+            Log.Error($"Görev {task.Id} başarısız: {ex.GetType().Name}: {ex.Message}" + (ex.InnerException != null ? $" ← {ex.InnerException.GetType().Name}: {ex.InnerException.Message}" : ""));
+            Log.Debug(ex.ToString());
         }
         task.FinishedAt = DateTime.Now; task.ElapsedMs = sw.ElapsedMilliseconds; task.Node = node;
         if (updatePlan)
@@ -271,7 +272,7 @@ public static class LineagePipeline
             }
             catch (Exception ex) { Log.Error($"plan.json güncellenemedi (görev {task.Id} {task.Status}; parça diskte): {ex.Message}"); }
         }
-        Log.Info($"Görev {task.Id}: {task.Status}, {sw.Elapsed.TotalSeconds:F0} s");
+        Log.Info($"Görev {task.Id}: {task.Status.ToUpperInvariant()}, {sw.Elapsed.TotalSeconds:F0} s");
         // katalog/önbellekler bir sonraki görev için serbest
         ModuleAnalyzer.ResetCaches();
         GC.Collect(); GC.WaitForPendingFinalizers();

@@ -101,7 +101,7 @@ sealed class DbTaskRunner
         if (jobSteps != null)
             foreach (var js in jobSteps.Where(j => NameComparer.Eq(j.Subsystem, "TSQL")))
                 list.Add(new ObjInfo { TypeCode = "JOB", Ref = new ObjRef(srv.Name, db.Name, "job", $"{js.JobName}#{js.StepId}", ObjType.JobStep), Definition = js.Command, DefaultSchema = "dbo", Db = db });
-        if (excluded > 0) Log.Info($"{excluded} modül ad filtresiyle (ExcludeModuleNameContains) dışlandı");
+        if (excluded > 0) Log.Debug($"{excluded} modül ad filtresiyle (ExcludeModuleNameContains) dışlandı");
         return list;
     }
 
@@ -114,11 +114,10 @@ sealed class DbTaskRunner
         var overlays = new ConcurrentDictionary<string, OverlayTable>(NameComparer.Instance);
         int found = 0, created = 0, scanned = 0;
         var preList = modules.Where(m => m.TypeCode is "P" or "TR" or "JOB" or "FILE" && (m.HasModuleRow || m.DefinitionLoaded) && !m.DefinitionMissing).ToList();
-        Log.Info($"[{srv.ConfigName}.{db.Name}] ön geçiş: {preList.Count} prosedür/trigger/job");
+        Log.Debug($"[{srv.ConfigName}.{db.Name}] ön geçiş: {preList.Count} prosedür/trigger/job");
         RunWorkers(preList, m =>
         {
             int n = Interlocked.Increment(ref scanned);
-            if (n % 5000 == 0) Log.Info($"  ön geçiş {n}/{preList.Count}");
             try
             {
                 var def = m.Definition;
@@ -166,11 +165,11 @@ sealed class DbTaskRunner
             }
             catch (Exception ex) { Log.Debug($"pre-pass {m.Ref}: {ex.Message}"); }
             finally { m.ReleaseDefinition(); }
-        }, stream: true);
+        }, stream: true, label: srv.ConfigName + "." + db.Name + " ön geçiş");
         foreach (var kv in callerArgs) res.CallerArgs[kv.Key] = kv.Value.ToDictionary(p => p.Key, p => p.Value.Keys.ToList());
         res.Overlays = overlays.Values.ToList();
         res.Scanned = scanned;
-        Log.Info($"[{srv.ConfigName}.{db.Name}] ön geçiş: {found} çağıran literal argümanı, {created} kod tarafından yaratılan tablo, {sw.ElapsedMilliseconds} ms");
+        Log.Info($"[{srv.ConfigName}.{db.Name}] ön geçiş: {preList.Count} modül, {found} çağıran literal argümanı, {created} kod yaratımı tablo, {sw.Elapsed.TotalSeconds:F0} s");
         return res;
     }
 
@@ -194,7 +193,7 @@ sealed class DbTaskRunner
                 if (srv != null && srv.Dbs.TryGetValue(o.Database, out var loaded) && loaded.Find(o.Schema, o.Name) == null) { oi.Db = loaded; loaded.Overlay.TryAdd(o.Schema + "." + o.Name, oi); }
             }
         }
-        Log.Info($"Ön geçiş yüklendi: {args} literal argüman, {ov} overlay tablo");
+        Log.Debug($"Ön geçiş yüklendi: {args} literal argüman, {ov} overlay tablo");
     }
 
     sealed class CallerArgVisitor : TSqlConcreteFragmentVisitor
@@ -219,33 +218,44 @@ sealed class DbTaskRunner
     }
 
     // ---------------- işçi havuzu: üretici (tanım akışı) + büyük stack'li tüketici thread'ler, sınırlı kuyruk
-    void RunWorkers(List<ObjInfo> modules, Action<ObjInfo> work, bool stream)
+    void RunWorkers(List<ObjInfo> modules, Action<ObjInfo> work, bool stream, string label)
     {
         int par = Math.Max(1, cfg.Parallelism);
-        using var queue = new BlockingCollection<ObjInfo>(boundedCapacity: par * 4);
+        var queue = new BlockingCollection<ObjInfo>(boundedCapacity: par * 4);
         int done = 0, total = modules.Count;
+        var progress = Stopwatch.StartNew();
         var workers = new List<Thread>();
         for (int w = 0; w < par; w++)
         {
             var t = new Thread(() =>
             {
-                foreach (var m in queue.GetConsumingEnumerable())
+                try
                 {
-                    try { work(m); }
-                    catch (Exception ex) { Log.Warn($"{m.Ref}: {ex.GetType().Name}: {ex.Message}"); }
-                    int d = Interlocked.Increment(ref done);
-                    if (d % 500 == 0 || d == total) Log.Info($"  {d}/{total} modül");
+                    foreach (var m in queue.GetConsumingEnumerable())
+                    {
+                        try { work(m); }
+                        catch (Exception ex) { Interlocked.Increment(ref workerErrors); Log.Debug($"{m.Ref}: {ex.GetType().Name}: {ex.Message}"); }
+                        int d = Interlocked.Increment(ref done);
+                        if (d < total && progress.Elapsed.TotalSeconds >= 60) { lock (progress) { if (progress.Elapsed.TotalSeconds >= 60) { Log.Info($"  [{label}] {d}/{total} modül"); progress.Restart(); } } }
+                    }
                 }
+                catch (ObjectDisposedException) { }
+                catch (Exception ex) { Log.Error($"işçi thread hatası: {ex.GetType().Name}: {ex.Message}"); }
             }, 64 * 1024 * 1024) { IsBackground = true, Name = "lineage-" + w };
             workers.Add(t); t.Start();
         }
+        Exception? producerError = null;
         try
         {
             foreach (var m in stream ? db.StreamModules(modules) : modules) queue.Add(m);
         }
+        catch (Exception ex) { producerError = ex; }
         finally { queue.CompleteAdding(); }
-        foreach (var t in workers) t.Join();
+        foreach (var t in workers) t.Join();     // kuyruk işçiler bitmeden kapatılmaz
+        queue.Dispose();
+        if (producerError != null) throw new InvalidOperationException("modül tanımları çekilirken hata: " + producerError.Message, producerError);
     }
+    int workerErrors;
 
     // ---------------- analiz
     public TaskMeta RunAnalyze(List<ObjInfo> modules, PartWriter parts, string engineSignature)
@@ -260,9 +270,8 @@ sealed class DbTaskRunner
                 if (incremental == null) Log.Warn("Önceki koşu bulunamadı; tam koşu");
             }
         }
-        Log.Info($"[{srv.ConfigName}.{db.Name}] analiz: {modules.Count} modül");
-        RunWorkers(modules, m => AnalyzeOne(m, parts), stream: true);
-        Log.Info($"[{srv.ConfigName}.{db.Name}] analiz bitti: {colRows} kolon, {objRows} nesne satırı, {sw.Elapsed.TotalSeconds:F0} s" + (incremental != null ? $" ({reusedModules} modül önceki koşudan)" : ""));
+        Log.Debug($"[{srv.ConfigName}.{db.Name}] analiz: {modules.Count} modül");
+        RunWorkers(modules, m => AnalyzeOne(m, parts), stream: true, label: srv.ConfigName + "." + db.Name);
         int missed = CatalogCrossCheck(parts);
         var meta = new TaskMeta
         {
@@ -272,7 +281,7 @@ sealed class DbTaskRunner
         foreach (var t in db.Modules.Where(m => m.TypeCode == "TR" && !m.IsDisabled && m.ParentObjectId != null))
             if (db.ById.TryGetValue(t.ParentObjectId!.Value, out var parent))
                 meta.Triggers.Add(new TriggerInfo { ParentServer = parent.Ref.Server, ParentDatabase = parent.Ref.Database, ParentSchema = parent.Ref.Schema, ParentName = parent.Ref.Name, Server = t.Ref.Server, Database = t.Ref.Database, Schema = t.Ref.Schema, Name = t.Ref.Name, Events = t.TriggerEvents });
-        meta.Summary = BuildSummary(engineSignature, (int)sw.ElapsedMilliseconds, missed);
+        meta.Summary = BuildSummary(engineSignature, sw, missed);
         meta.RowCounts = parts.Counts();
         return meta;
     }
@@ -295,7 +304,12 @@ sealed class DbTaskRunner
                 Flush(mod, row, st, res, parts);
                 return;
             }
-            if (def != null && def.Length > cfg.MaxDefinitionChars)
+            if (mod.LoadError != null)
+            {
+                row.ParseStatus = "Error"; row.Errors = mod.LoadError;
+                res = CatalogFallback(mod, row.ParseStatus);
+            }
+            else if (def != null && def.Length > cfg.MaxDefinitionChars)
             {
                 row.ParseStatus = "DefinitionSizeLimit"; row.Errors = $"tanım {def.Length:N0} karakter > MaxDefinitionChars {cfg.MaxDefinitionChars:N0}";
                 res = CatalogFallback(mod, row.ParseStatus);
@@ -323,7 +337,7 @@ sealed class DbTaskRunner
         catch (Exception ex)
         {
             row.ParseStatus = "Error"; row.Errors = Join(row.Errors, ex.GetType().Name + ": " + ex.Message);
-            Log.Warn($"{mod.Ref}: {ex.GetType().Name}: {ex.Message}");
+            Log.Debug($"{mod.Ref}: {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
@@ -402,13 +416,14 @@ sealed class DbTaskRunner
             missed++;
             parts.Add("Unresolved", new UnresolvedRow { RunId = runId, Server = mod.Ref.Server, Database = mod.Ref.Database, ModuleSchema = mod.Ref.Schema, ModuleName = mod.Ref.Name, Kind = "CatalogDepMissed", Severity = "warning", Name = $"{d.Database ?? db.Name}.{d.Schema ?? "?"}.{d.Name}", Note = "sys.sql_expression_dependencies'te var, analizde yok" });
         }
-        Log.Info($"Katalog çapraz kontrolü: {missed} kaçırılmış referans (Unresolved sayfasında CatalogDepMissed)");
+        Log.Debug($"Katalog çapraz kontrolü: {missed} kaçırılmış referans (Unresolved sayfasında CatalogDepMissed)");
         return missed;
     }
 
     // ---------------- özet (bu DB; ObjectLineageRows/CollapsedRows merge'de tamamlanır)
-    SummaryRow BuildSummary(string engineSignature, int elapsedMs, int missed)
+    SummaryRow BuildSummary(string engineSignature, Stopwatch sw, int missed)
     {
+        int elapsedMs = (int)sw.ElapsedMilliseconds;
         var st = stats.Where(s => s.Result != null).Select(s => s.Result!).ToList();
         var statuses = stats.Select(s => s.Status).ToList();
         var row = new SummaryRow
@@ -425,7 +440,8 @@ sealed class DbTaskRunner
         row.ParseRate = withDef == 0 ? 1 : Math.Round((row.Parsed + row.ParsedWithHoles) / (double)withDef, 4);
         row.BindRate = row.ObjectRefs == 0 ? 1 : Math.Round(row.ObjectRefsResolved / (double)row.ObjectRefs, 4);
         row.DynamicResolutionRate = row.DynamicSites == 0 ? 1 : Math.Round(row.DynamicResolved / (double)row.DynamicSites, 4);
-        Log.Info($"  {row.Server}.{row.Database}: modül {row.Modules}, parse {row.ParseRate:P1}, bind {row.BindRate:P1}, dinamik {row.DynamicSites} site / {row.DynamicResolutionRate:P0}, kolon satırı {row.ColumnLineageRows}");
+        int errors = statuses.Count(x => x is "Error" or "Timeout");
+        Log.Info($"[{srv.ConfigName}.{db.Name}] analiz: modül {row.Modules}, parse {row.ParseRate:P1}, bind {row.BindRate:P1}, dinamik {row.DynamicSites} site / {row.DynamicResolutionRate:P0}, kolon {row.ColumnLineageRows:N0}, nesne {row.ObjectLineageRows:N0}, katalog kaçağı {missed}{(errors > 0 ? $", HATA {errors} modül (Modules.csv Errors)" : "")}{(row.ReusedModules > 0 ? $", {row.ReusedModules} önceki koşudan" : "")}, {sw.Elapsed.TotalSeconds:F0} s");
         return row;
     }
 }
