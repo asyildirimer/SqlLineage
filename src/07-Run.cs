@@ -96,12 +96,13 @@ sealed class DbTaskRunner
         foreach (var m in db.Modules)
         {
             if (cfg.ExcludeModuleNameContains.Any(x => m.Ref.Name.Contains(x, StringComparison.OrdinalIgnoreCase))) { excluded++; continue; }
+            if (cfg.ExcludeSchemas.Any(x => NameComparer.Eq(x, m.Ref.Schema))) { excluded++; continue; }
             list.Add(m);
         }
         if (jobSteps != null)
             foreach (var js in jobSteps.Where(j => NameComparer.Eq(j.Subsystem, "TSQL")))
                 list.Add(new ObjInfo { TypeCode = "JOB", Ref = new ObjRef(srv.Name, db.Name, "job", $"{js.JobName}#{js.StepId}", ObjType.JobStep), Definition = js.Command, DefaultSchema = "dbo", Db = db });
-        if (excluded > 0) Log.Debug($"{excluded} modül ad filtresiyle (ExcludeModuleNameContains) dışlandı");
+        if (excluded > 0) Log.Debug($"{excluded} modül ad/şema filtresiyle (excludeModuleNameContains / excludeSchemas) dışlandı");
         return list;
     }
 

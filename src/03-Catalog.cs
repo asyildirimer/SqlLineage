@@ -258,6 +258,19 @@ static class ConfigTableReader
 
 static class CatalogLoader
 {
+    static readonly HashSet<string> SystemDbs = new(NameComparer.Instance) { "master", "msdb", "tempdb", "model", "distribution" };
+    /// <summary>Job adımı analiz edilecek mi: TSQL alt sistemi, DB'si excludeDatabases / excludeJobDatabases'te değil.</summary>
+    public static bool JobStepWanted(LineageConfig cfg, ServerCatalog s, JobStepInfo js)
+    {
+        if (!NameComparer.Eq(js.Subsystem, "TSQL")) return false;
+        var cc = cfg.Connections.FirstOrDefault(c => NameComparer.Eq(c.Name, s.ConfigName));
+        if (cfg.ExcludeJobDatabases.Any(x => NameComparer.Eq(x, js.DatabaseName))) return false;
+        if (cfg.ExcludeDatabases.Any(x => NameComparer.Eq(x, js.DatabaseName))) return false;
+        if (cc != null && cc.ExcludeDatabases.Any(x => NameComparer.Eq(x, js.DatabaseName))) return false;
+        return true;
+    }
+    public static bool IsSystemDb(string name) => SystemDbs.Contains(name);
+
     /// <summary>Sunucuları bağlar: sürüm, linked server'lar, job adımları, filtreden geçen DB listesi. DB içeriği yüklenmez (tembel).</summary>
     public static async Task<Catalog> LoadServersAsync(LineageConfig cfg)
     {

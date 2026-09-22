@@ -99,6 +99,10 @@ public sealed class LineageConfig
     /// <summary>Adı bu parçaları içeren nesnelere giden/gelen satırlar çıktıdan düşülür (politika: eski/silinecek kopyalar).</summary>
     public List<string> ExcludeObjectNameContains { get; set; } = new();
     public List<string> ExcludeDatabases { get; set; } = new();
+    /// <summary>Bu şemalardaki modüller (proc/view/fonksiyon/trigger) analiz edilmez; tablolar katalogda kalır (referanslar çözülür).</summary>
+    public List<string> ExcludeSchemas { get; set; } = new();
+    /// <summary>Bu DB bağlamında koşan Agent job adımları analiz edilmez (örn. ["msdb","tempdb"]). excludeDatabases da job adımlarına uygulanır.</summary>
+    public List<string> ExcludeJobDatabases { get; set; } = new();
     /// <summary>Global linked server / DNS alias → taranan sunucu adı.</summary>
     public Dictionary<string, string> ServerAliases { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Bu boyutu (karakter) aşan tanımlar analiz edilmez (DefinitionSizeLimit).</summary>
@@ -129,6 +133,10 @@ public sealed class ConnectionConfig
     /// <summary>Boşsa global "databases" geçerli.</summary>
     public List<string> Databases { get; set; } = new();
     public List<string> ExcludeDatabases { get; set; } = new();
+    /// <summary>Bu şemalardaki modüller (proc/view/fonksiyon/trigger) analiz edilmez; tablolar katalogda kalır (referanslar çözülür).</summary>
+    public List<string> ExcludeSchemas { get; set; } = new();
+    /// <summary>Bu DB bağlamında koşan Agent job adımları analiz edilmez (örn. ["msdb","tempdb"]). excludeDatabases da job adımlarına uygulanır.</summary>
+    public List<string> ExcludeJobDatabases { get; set; } = new();
     /// <summary>Bu sunucuda tanımlı linked server adı → taranan sunucunun adı (sys.servers.data_source eşleşmiyorsa).</summary>
     public Dictionary<string, string> ServerAliases { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }

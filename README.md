@@ -121,6 +121,10 @@ Microsoft.Data.SqlClient varsayılan olarak `Encrypt=True`; sertifika yoksa bağ
   "workDirectory": "work",       // plan.json, prepass/, parts/ (dağıtıkta paylaşılan klasör)
   "compressParts": false,
   "mergeDedup": true,            // merge'de ColumnLineage/ObjectLineage satır tekilleştirme (yeniden koşulan görevlere karşı)
+  "excludeDatabases": ["dw_archive"],          // global; bağlantı başına da verilebilir. Job adımlarına da uygulanır
+  "excludeSchemas": ["etl_old", "tmp"],        // bu şemalardaki modüller analiz edilmez (tablolar katalogda kalır)
+  "excludeJobDatabases": ["msdb", "tempdb"],   // bu DB bağlamında koşan Agent job adımları analiz edilmez
+  "excludeModuleNameContains": ["_old", "_sil"],
   "parallelism": 8,
   "moduleTimeoutSeconds": 60,
   "maxDynamicAlternatives": 16,
@@ -178,7 +182,8 @@ dotnet run -- infa --xml export.xml                    # Informatica modu
   (motor sürümü + ayarlar + katalog şekli) karşılaştırılır; aynı olan modüller analiz edilmez, satırları geri yüklenir;
   Interprocedural/Trigger/Collapsed merge'de yeniden hesaplanır. Katalogda kolon değişirse o DB tamamen yeniden analiz edilir.
 - `--statements`: her ifadenin metni (`Statements` tablosu). `TopIssues`: en çok sorun üreten modüller. `Unresolved.Severity`: error/warning/info.
-- Politika: `excludeDatabases` (global ve bağlantı başına), bağlantı başına `databases`, `serverAliases` (linked server adı → taranan sunucu),
+- Politika: `excludeDatabases` (global ve bağlantı başına; job adımlarına da uygulanır), `excludeSchemas` (şemadaki modüller analiz edilmez),
+  `excludeJobDatabases` (o DB bağlamındaki job adımları atlanır), bağlantı başına `databases`, `serverAliases` (linked server adı → taranan sunucu),
   `excludeModuleNameContains`, `excludeObjectNameContains` (bu adlara giden/gelen satırlar düşülür), `maxDefinitionChars`.
 
 ## MSSQL'e yükleme

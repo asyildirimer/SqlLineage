@@ -130,7 +130,7 @@ public static class LineagePipeline
                 foreach (var kind in new[] { "prepass", "analyze" })
                     plan.Tasks.Add(new PlanTask { Id = PlanTask.MakeId(kind, s.ConfigName, dbName), Kind = kind, Phase = kind == "prepass" ? 1 : 2, Server = s.ConfigName, Database = dbName, Modules = mods, DefinitionBytes = bytes });
             }
-            int orphanJobs = s.JobSteps.Count(j => NameComparer.Eq(j.Subsystem, "TSQL") && !s.Knows(j.DatabaseName));
+            int orphanJobs = s.JobSteps.Count(j => CatalogLoader.JobStepWanted(cfg, s, j) && !s.Knows(j.DatabaseName));
             if (orphanJobs > 0)
                 foreach (var kind in new[] { "prepass", "analyze" })
                     plan.Tasks.Add(new PlanTask { Id = PlanTask.MakeId(kind, s.ConfigName, PlanTask.JobsDb), Kind = kind, Phase = kind == "prepass" ? 1 : 2, Server = s.ConfigName, Database = PlanTask.JobsDb, Modules = orphanJobs });
@@ -208,7 +208,7 @@ public static class LineagePipeline
                 db = new DbCatalog { Server = srv.Name, Name = PlanTask.JobsDb, Compat = 150, DepsLoaded = true };
                 var stubs = new Dictionary<string, DbCatalog>(NameComparer.Instance);
                 modules = new List<ObjInfo>();
-                foreach (var js in srv.JobSteps.Where(j => NameComparer.Eq(j.Subsystem, "TSQL") && !srv.Knows(j.DatabaseName)))
+                foreach (var js in srv.JobSteps.Where(j => CatalogLoader.JobStepWanted(cfg, srv, j) && !srv.Knows(j.DatabaseName)))
                 {
                     if (!stubs.TryGetValue(js.DatabaseName, out var sdb)) stubs[js.DatabaseName] = sdb = new DbCatalog { Server = srv.Name, Name = js.DatabaseName, Compat = 150, DepsLoaded = true };
                     modules.Add(new ObjInfo { TypeCode = "JOB", Ref = new ObjRef(srv.Name, js.DatabaseName, "job", $"{js.JobName}#{js.StepId}", ObjType.JobStep), Definition = js.Command, DefaultSchema = "dbo", Db = sdb });
@@ -217,7 +217,7 @@ public static class LineagePipeline
             else
             {
                 db = CatalogLoader.EnsureTargetDb(cfg, cat, srv, task.Database) ?? throw new InvalidOperationException($"DB yüklenemedi: {task.Server}.{task.Database}");
-                modules = new DbTaskRunner(cfg, runId, cat, srv, db).CollectModules(srv.JobSteps.Where(j => NameComparer.Eq(j.DatabaseName, db.Name)));
+                modules = new DbTaskRunner(cfg, runId, cat, srv, db).CollectModules(srv.JobSteps.Where(j => NameComparer.Eq(j.DatabaseName, db.Name) && CatalogLoader.JobStepWanted(cfg, srv, j)));
             }
             var runner = new DbTaskRunner(cfg, runId, cat, srv, db);
             string part = PlanStore.PartDirName(task);

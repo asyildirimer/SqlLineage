@@ -681,9 +681,15 @@ sealed class InfaRun
                     });
                 }
             int ok = 0, err = 0, instTotal = 0, connTotal = 0, edgeTotal = 0, sqlO = 0, sqlP = 0, tgtCols = 0, tgtWith = 0;
+            int mi = 0; var hb = Stopwatch.StartNew();
             foreach (var m in f.Mappings.Values)
             {
+                mi++;
+                string mname = (string?)m.Attribute("NAME") ?? "";
+                if (hb.Elapsed.TotalSeconds >= 60) { InfaLog.Info($"  [{f.Name}] {mi}/{f.Mappings.Count} mapping — şimdi: {mname}"); hb.Restart(); }
+                var msw = Stopwatch.StartNew();
                 var g = new MappingAnalyzer(folders, f).Analyze(m);
+                long analyzeMs = msw.ElapsedMilliseconds;
                 var mSessions = sessions.Where(s => s.Mapping.Equals(g.Name, StringComparison.OrdinalIgnoreCase)).ToList();
                 int sessionCount = mSessions.Count;
                 if (!cfg.PerSession || mSessions.Count == 0) mSessions = new List<SessionInfo> { new SessionInfo { Folder = f.Name, Mapping = g.Name } };
@@ -699,6 +705,8 @@ sealed class InfaRun
                     Connectors = g.Connectors, PortEdges = g.Edges.Count, SqlOverrides = g.SqlOverrides, SqlOverridesParsed = g.SqlOverridesParsed, UnresolvedCount = g.Unresolved.Count, Sessions = sessionCount, Errors = g.Errors
                 });
                 if (g.Errors == "") ok++; else err++;
+                if (msw.ElapsedMilliseconds > 30_000) InfaLog.Warn($"  [{f.Name}] {g.Name}: {msw.ElapsedMilliseconds / 1000} s (analiz {analyzeMs / 1000} s, fiziksel {(msw.ElapsedMilliseconds - analyzeMs) / 1000} s; {g.Instances.Count} instance, {g.Edges.Count} kenar, {sessionCount} session)");
+                _memo.Remove(g);
                 instTotal += g.Instances.Count; connTotal += g.Connectors; edgeTotal += g.Edges.Count; sqlO += g.SqlOverrides; sqlP += g.SqlOverridesParsed;
             }
             SummaryRows.Add(new SummaryRow
@@ -826,7 +834,6 @@ sealed class InfaRun
         var result = new List<SrcResult>();
         if (!onStack.Add(key)) return result;   // döngü: bu kenar üzerinden yol yok
         var edges = g.Incoming.GetValueOrDefault(key) ?? g.Incoming.GetValueOrDefault(MappingGraph.Key(inst, "*"));
-        bool complete = true;
         if (edges == null || edges.Count == 0)
             result.Add(new SrcResult(inst, port, 0, inst + "." + port, FlowKind.Direct, ""));   // girişi olmayan port: sabit/bağlantısız kaynak
         else
@@ -843,7 +850,7 @@ sealed class InfaRun
                     continue;
                 }
                 string fk = MappingGraph.Key(e.FromInst, e.FromPort);
-                if (onStack.Contains(fk)) { complete = false; continue; }
+                if (onStack.Contains(fk)) continue;   // döngü (örn. v = v + 1 değişken portu): bu kenar üzerinden yol yok
                 foreach (var r in Sources(g, e.FromInst, e.FromPort, onStack))
                 {
                     var k = (r.kind == FlowKind.Indirect || e.Kind == FlowKind.Indirect) ? FlowKind.Indirect : Stronger(r.kind, e.Kind);
@@ -855,7 +862,7 @@ sealed class InfaRun
             result.AddRange(best.Values);
         }
         onStack.Remove(key);
-        if (complete) memo[key] = result;   // döngü nedeniyle eksik kalan sonuç önbelleğe alınmaz
+        memo[key] = result;
         return result;
 
         static void Add(Dictionary<string, SrcResult> best, SrcResult r)
