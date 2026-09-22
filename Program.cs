@@ -6,4 +6,5 @@
 CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
 CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.InvariantCulture;
 CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);   // windows-1254 gibi kod sayfalı XML/SQL dosyaları
 return await App.RunAsync(args);

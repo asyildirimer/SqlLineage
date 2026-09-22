@@ -7,6 +7,7 @@ public static class App
     public const string EngineVersion = "2.0.0";
     public static async Task<int> RunAsync(string[] args)
     {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);   // API'den çağrılırken de (Program.cs atlanırsa)
         if (args.Length > 0 && args[0].Equals("infa", StringComparison.OrdinalIgnoreCase)) return await InfaLineage.App.RunAsync(args[1..]);
         try
         {
